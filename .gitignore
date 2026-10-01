@@ -1,0 +1,5 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.log
+node_modules/.tmp-*.cjs

@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:merge": "node scripts/test-merge.mjs",
+    "test:lock": "node scripts/test-lock.mjs",
+    "test": "node scripts/test-merge.mjs && node scripts/test-lock.mjs"
   },
   "dependencies": {
     "@arco-design/web-vue": "2.58.0",
