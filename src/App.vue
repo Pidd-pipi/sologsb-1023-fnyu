@@ -21,6 +21,11 @@ const {
   differenceCount,
   acceptedCount,
   unresolvedCount,
+  relayState,
+  dirty,
+  pendingChanges,
+  conflictCount,
+  pendingReviewCount,
   runAlignment,
   recalculate,
   updateRow,
@@ -28,6 +33,7 @@ const {
   moveRow,
   acceptRows,
   acceptAll,
+  resolveConflict,
   nextDifference,
   addVersion,
   undo,
@@ -38,12 +44,15 @@ const {
 } = useCollation();
 
 const importVisible = ref(false);
+const conflictVisible = ref(false);
 const onlyDifferences = ref(false);
 const rowQuery = ref('');
 const noteDraft = ref('');
 const sourceDraft = ref('');
 const importForm = ref({ name: '', source: '', text: '' });
 const fileInput = ref<HTMLInputElement | null>(null);
+
+const conflictRows = computed(() => rows.value.filter((row) => row.conflict));
 
 const columns = [
   { title: '状态', dataIndex: 'status', slotName: 'status', width: 122, fixed: 'left' as const },
@@ -128,9 +137,19 @@ function download(filename: string, text: string, type: string) {
 
 function handleExport(kind: 'markdown' | 'json') {
   if (kind === 'markdown') {
-    download('校勘记.md', exportMarkdown(), 'text/markdown;charset=utf-8');
+    const text = exportMarkdown();
+    if (!text) {
+      Message.warning(message.value);
+      return;
+    }
+    download('校勘记.md', text, 'text/markdown;charset=utf-8');
   } else {
-    download('校勘数据.json', exportJson(), 'application/json;charset=utf-8');
+    const text = exportJson();
+    if (!text) {
+      Message.warning(message.value);
+      return;
+    }
+    download('校勘数据.json', text, 'application/json;charset=utf-8');
   }
 }
 
@@ -203,6 +222,17 @@ window.addEventListener('beforeunload', beforeUnload);
           <div class="brand-subtitle">自动对齐、人工修正、校记导出，全程本地保存</div>
         </div>
         <a-space style="margin-left: auto" wrap>
+          <a-tag :color="relayState === 'holder' ? 'green' : 'gray'" size="large">
+            <span class="status-dot" :class="relayState === 'holder' ? 'relay-dot-live' : ''" />
+            {{ relayState === 'holder' ? '本机页签：写入中' : '等待写入权' }}
+          </a-tag>
+          <a-tag v-if="relayState === 'waiter' && pendingChanges" color="orange" size="large">
+            离线改动 {{ pendingChanges }} 处 · 待合并
+          </a-tag>
+          <a-tag v-if="pendingReviewCount" color="arcoblue" size="large">待复核 {{ pendingReviewCount }}</a-tag>
+          <a-button v-if="conflictCount" type="primary" status="danger" @click="conflictVisible = true">
+            待裁决冲突 {{ conflictCount }}
+          </a-button>
           <a-button :disabled="!canUndo" @click="undo">撤销</a-button>
           <a-button :disabled="!canRedo" @click="redo">重做</a-button>
           <a-button type="primary" :loading="processing" @click="runAlignment()">重新自动对齐</a-button>
@@ -325,9 +355,11 @@ window.addEventListener('beforeunload', beforeUnload);
             @row-click="onRowClick"
           >
             <template #status="{ record }">
-              <a-tag :color="statusColor(record.status)">
+              <a-tag v-if="record.conflict" color="red">待裁决</a-tag>
+              <a-tag v-else :color="statusColor(record.status)">
                 {{ statusLabel(record.status) }}
               </a-tag>
+              <a-tag v-if="record.pendingReview" color="arcoblue" style="margin-top: 4px">待复核</a-tag>
               <div style="margin-top: 6px; color: #86909c; font-size: 11px">
                 相似度 {{ Math.round(record.similarity * 100) }}%
               </div>
@@ -367,11 +399,29 @@ window.addEventListener('beforeunload', beforeUnload);
             </template>
 
             <template #note="{ record }">
-              <div style="font-size: 12px; line-height: 1.6; color: #4e5969">
+              <div v-if="record.conflict" class="conflict-note">
+                <div class="conflict-note-side">
+                  <span class="conflict-note-tag local">本方</span>
+                  <span>{{ statusLabel(record.conflict.local.status) }}</span>
+                  <span v-if="record.conflict.local.note"> · {{ record.conflict.local.note }}</span>
+                  <span v-if="record.conflict.local.source"> · {{ record.conflict.local.source }}</span>
+                </div>
+                <div class="conflict-note-side">
+                  <span class="conflict-note-tag remote">对方</span>
+                  <span>{{ statusLabel(record.conflict.remote.status) }}</span>
+                  <span v-if="record.conflict.remote.note"> · {{ record.conflict.remote.note }}</span>
+                  <span v-if="record.conflict.remote.source"> · {{ record.conflict.remote.source }}</span>
+                </div>
+                <a-button size="mini" status="danger" style="margin-top: 6px" @click.stop="conflictVisible = true">
+                  去裁决
+                </a-button>
+              </div>
+              <div v-else style="font-size: 12px; line-height: 1.6; color: #4e5969">
                 <div>{{ record.note || '尚未填写校勘说明' }}</div>
                 <div v-if="record.source" style="margin-top: 5px; color: #86909c">来源：{{ record.source }}</div>
                 <a-tag v-if="record.accepted" size="small" color="green" style="margin-top: 7px">已接受</a-tag>
                 <a-tag v-else size="small" color="orange" style="margin-top: 7px">待处理</a-tag>
+                <a-tag v-if="record.pendingReview" size="small" color="arcoblue" style="margin-top: 7px">规则变更待复核</a-tag>
               </div>
             </template>
 
@@ -391,6 +441,44 @@ window.addEventListener('beforeunload', beforeUnload);
         </section>
 
         <template v-if="selectedRow">
+          <section v-if="selectedRow.conflict" class="panel-section">
+            <a-alert type="error" :show-icon="true" title="行合并冲突待裁决">
+              <div style="margin: 6px 0 10px; font-size: 12px; line-height: 1.7">
+                两个页签离线修改了同一对齐行，双方判断、说明与来源均已保留。裁决前不能接受或导出。
+              </div>
+              <div class="conflict-case-card">
+                <div class="conflict-case-title local">本方判断（本页签离线改动）</div>
+                <div>类别：{{ statusLabel(selectedRow.conflict.local.status) }}</div>
+                <div>说明：{{ selectedRow.conflict.local.note || '—' }}</div>
+                <div>来源：{{ selectedRow.conflict.local.source || '—' }}</div>
+                <a-button
+                  long
+                  size="small"
+                  type="primary"
+                  style="margin-top: 8px"
+                  @click="resolveConflict(selectedRow.id, 'local')"
+                >
+                  采用本方判断
+                </a-button>
+              </div>
+              <div class="conflict-case-card" style="margin-top: 10px">
+                <div class="conflict-case-title remote">对方判断（其他页签已写入）</div>
+                <div>类别：{{ statusLabel(selectedRow.conflict.remote.status) }}</div>
+                <div>说明：{{ selectedRow.conflict.remote.note || '—' }}</div>
+                <div>来源：{{ selectedRow.conflict.remote.source || '—' }}</div>
+                <a-button
+                  long
+                  size="small"
+                  type="outline"
+                  style="margin-top: 8px"
+                  @click="resolveConflict(selectedRow.id, 'remote')"
+                >
+                  采用对方判断
+                </a-button>
+              </div>
+            </a-alert>
+          </section>
+
           <section class="panel-section">
             <div style="margin-bottom: 10px; color: #86909c; font-size: 12px">判断类别</div>
             <a-select :model-value="selectedRow.status" style="width: 100%" @change="updateStatus">
@@ -438,10 +526,14 @@ window.addEventListener('beforeunload', beforeUnload);
               long
               :status="selectedRow.accepted ? 'normal' : 'success'"
               :type="selectedRow.accepted ? 'outline' : 'primary'"
+              :disabled="Boolean(selectedRow.conflict)"
               @click="updateRow(selectedRow.id, { accepted: !selectedRow.accepted })"
             >
-              {{ selectedRow.accepted ? '撤回接受状态' : '接受这条校勘建议' }}
+              {{ selectedRow.conflict ? '冲突待裁决，暂不能接受' : selectedRow.accepted ? '撤回接受状态' : '接受这条校勘建议' }}
             </a-button>
+            <a-tag v-if="selectedRow.pendingReview" color="arcoblue" style="margin-top: 8px">
+              规则变更后人工挪动保留，需重新复核配对
+            </a-tag>
           </section>
         </template>
 
@@ -488,5 +580,38 @@ window.addEventListener('beforeunload', beforeUnload);
       </a-form-item>
       <a-alert type="info" :show-icon="true">导入仅写入当前浏览器。对齐过程会分片执行，原文不会被自动改写。</a-alert>
     </a-form>
+  </a-modal>
+
+  <a-modal v-model:visible="conflictVisible" title="行合并冲突待裁决" width="860px" :footer="false">
+    <a-alert type="warning" :show-icon="true" style="margin-bottom: 12px">
+      两个页签离线修改了同一对齐行，双方的判断、说明与来源均已保留。裁决前这些行不能接受或导出；选择保留哪一方后即按新规则重算。
+    </a-alert>
+    <a-empty v-if="!conflictRows.length" description="没有待裁决冲突" />
+    <div v-for="row in conflictRows" :key="row.id" class="conflict-case">
+      <div class="conflict-pair">
+        <span>底本：{{ row.left?.text || '（无）' }}</span>
+        <span>参校本：{{ row.right?.text || '（无）' }}</span>
+      </div>
+      <div class="conflict-cards">
+        <div class="conflict-case-card">
+          <div class="conflict-case-title local">本方判断（本页签离线改动）</div>
+          <div>类别：{{ statusLabel(row.conflict!.local.status) }}</div>
+          <div>说明：{{ row.conflict!.local.note || '—' }}</div>
+          <div>来源：{{ row.conflict!.local.source || '—' }}</div>
+          <a-button type="primary" size="small" style="margin-top: 8px" @click="resolveConflict(row.id, 'local')">
+            采用本方判断
+          </a-button>
+        </div>
+        <div class="conflict-case-card">
+          <div class="conflict-case-title remote">对方判断（其他页签已写入）</div>
+          <div>类别：{{ statusLabel(row.conflict!.remote.status) }}</div>
+          <div>说明：{{ row.conflict!.remote.note || '—' }}</div>
+          <div>来源：{{ row.conflict!.remote.source || '—' }}</div>
+          <a-button type="outline" size="small" style="margin-top: 8px" @click="resolveConflict(row.id, 'remote')">
+            采用对方判断
+          </a-button>
+        </div>
+      </div>
+    </div>
   </a-modal>
 </template>

@@ -1,15 +1,30 @@
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { sampleVersions, splitIntoUnits } from '../data';
+import {
+  HEARTBEAT_INTERVAL,
+  LEASE_KEY,
+  LEASE_TTL,
+  STORAGE_KEY,
+  anchorOf,
+  leaseIsStale,
+  mergeStates,
+  newTabId,
+  readLease,
+  removeLease,
+  rulesEqual,
+  wait,
+  writeLease
+} from '../collab';
 import type {
   AlignmentRow,
   ComparisonRules,
   DifferenceStatus,
   PersistedCollationState,
+  RowConflict,
   TextUnit,
-  VersionDocument
+  VersionDocument,
+  WriteLease
 } from '../types';
-
-const STORAGE_KEY = 'sologsb-1023/multi-version-collation/v1';
 
 const variantMap: Record<string, string> = {
   為: '为',
@@ -189,8 +204,25 @@ export function useCollation() {
   const rightVersion = computed(() => versions.value.find((item) => item.id === rightVersionId.value));
   const selectedRow = computed(() => rows.value.find((item) => item.id === selectedRowId.value));
   const differenceCount = computed(() => rows.value.filter((row) => row.status !== 'same').length);
-  const acceptedCount = computed(() => rows.value.filter((row) => row.accepted).length);
+  const acceptedCount = computed(() => rows.value.filter((row) => row.accepted && !row.conflict).length);
   const unresolvedCount = computed(() => rows.value.filter((row) => !row.accepted && row.status !== 'same').length);
+
+  // ---- 离线校勘接力：写入租约 / 心跳 / 合并状态 ----
+  const tabId = newTabId();
+  /** holder = 本页签持有写入权；waiter = 其他页签在写，本页签离线改动稍后合并 */
+  const relayState = ref<'holder' | 'waiter'>('waiter');
+  const leaseHolderId = ref('');
+  /** 本页签有尚未合并的离线改动 */
+  const dirty = ref(false);
+  /** 本页签相对上次同步草稿的离线改动行数 */
+  const pendingChanges = ref(0);
+  const conflictCount = computed(() => rows.value.filter((row) => row.conflict).length);
+  const pendingReviewCount = computed(() => rows.value.filter((row) => row.pendingReview).length);
+
+  /** 上次共同见到的草稿（JSON 字符串），用于三方合并 */
+  let baseRaw = '';
+  let heartbeatTimer: number | undefined;
+  let merging = false;
 
   function snapshot(): string {
     const data: PersistedCollationState = {
@@ -204,8 +236,86 @@ export function useCollation() {
     return JSON.stringify(data);
   }
 
+  function restore(raw: string) {
+    const parsed = JSON.parse(raw) as PersistedCollationState;
+    versions.value = parsed.versions;
+    leftVersionId.value = parsed.leftVersionId;
+    rightVersionId.value = parsed.rightVersionId;
+    rows.value = parsed.rows;
+    rules.value = parsed.rules;
+    selectedRowId.value = parsed.selectedRowId;
+  }
+
+  /** 容量探针：先写一条等大的探针数据，成功才允许正式写入；失败则原稿不动 */
+  function probeQuota(raw: string): boolean {
+    try {
+      const probeKey = `${STORAGE_KEY}__probe`;
+      localStorage.setItem(probeKey, raw);
+      localStorage.removeItem(probeKey);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function writeDraft(raw: string): boolean {
+    if (!probeQuota(raw)) {
+      message.value = '本地存储容量不足，已拒绝写入，原稿未改动';
+      return false;
+    }
+    try {
+      localStorage.setItem(STORAGE_KEY, raw);
+      return true;
+    } catch {
+      message.value = '本地存储写入失败，原稿未改动';
+      return false;
+    }
+  }
+
+  function refreshPendingCount() {
+    if (!baseRaw) {
+      pendingChanges.value = dirty.value ? rows.value.length : 0;
+      return;
+    }
+    try {
+      const baseRows = (JSON.parse(baseRaw) as PersistedCollationState).rows;
+      const baseByAnchor = new Map(baseRows.map((row) => [anchorOf(row), row]));
+      let count = 0;
+      rows.value.forEach((row) => {
+        const baseRow = baseByAnchor.get(anchorOf(row));
+        if (!baseRow) {
+          count += 1;
+          return;
+        }
+        const changed =
+          row.status !== baseRow.status ||
+          row.note !== baseRow.note ||
+          row.source !== baseRow.source ||
+          row.accepted !== baseRow.accepted ||
+          row.manuallyAdjusted !== baseRow.manuallyAdjusted ||
+          row.pendingReview !== baseRow.pendingReview ||
+          Boolean(row.conflict) !== Boolean(baseRow.conflict);
+        if (changed) count += 1;
+      });
+      pendingChanges.value = count;
+    } catch {
+      pendingChanges.value = 0;
+    }
+  }
+
+  /** 只有持有写入权的页签才落盘；等待页签的改动先记在本地，合并时再写入 */
   function persist() {
-    localStorage.setItem(STORAGE_KEY, snapshot());
+    if (relayState.value !== 'holder') {
+      dirty.value = true;
+      refreshPendingCount();
+      return;
+    }
+    const raw = snapshot();
+    if (writeDraft(raw)) {
+      baseRaw = raw;
+      dirty.value = false;
+      refreshPendingCount();
+    }
   }
 
   function commit(label: string, mutate: () => void) {
@@ -217,23 +327,13 @@ export function useCollation() {
     persist();
   }
 
-  function restore(raw: string) {
-    const parsed = JSON.parse(raw) as PersistedCollationState;
-    versions.value = parsed.versions;
-    leftVersionId.value = parsed.leftVersionId;
-    rightVersionId.value = parsed.rightVersionId;
-    rows.value = parsed.rows;
-    rules.value = parsed.rules;
-    selectedRowId.value = parsed.selectedRowId;
-    persist();
-  }
-
   function undo() {
     const previous = history.value.pop();
     if (!previous) return;
     future.value.push(snapshot());
     restore(previous);
     message.value = '已撤销上一步操作';
+    persist();
   }
 
   function redo() {
@@ -242,6 +342,23 @@ export function useCollation() {
     history.value.push(snapshot());
     restore(next);
     message.value = '已重做上一步操作';
+    persist();
+  }
+
+  /** 比较规则变更后：已接受校勘记录失效重算；人工挪动保留配对但标待复核 */
+  function applyRulesInvalidation(target: AlignmentRow[], nextRules: ComparisonRules) {
+    target.forEach((row) => {
+      if (row.conflict) return;
+      if (row.left && row.right) {
+        const score = Number(
+          similarity(normalized(row.left.text, nextRules), normalized(row.right.text, nextRules)).toFixed(3)
+        );
+        row.similarity = score;
+        row.status = statusFor(row.left, row.right, score);
+      }
+      row.accepted = false;
+      if (row.manuallyAdjusted) row.pendingReview = true;
+    });
   }
 
   async function runAlignment(commitHistory = true) {
@@ -269,14 +386,8 @@ export function useCollation() {
   }
 
   function recalculate() {
-    commit('已按比较规则重算差异', () => {
-      rows.value = rows.value.map((row) => {
-        if (!row.left || !row.right) return row;
-        const score = Number(
-          similarity(normalized(row.left.text, rules.value), normalized(row.right.text, rules.value)).toFixed(3)
-        );
-        return { ...row, similarity: score, status: statusFor(row.left, row.right, score) };
-      });
+    commit('已按比较规则重算差异，已接受记录失效', () => {
+      applyRulesInvalidation(rows.value, rules.value);
       selectedRowIds.value = [];
     });
   }
@@ -284,7 +395,7 @@ export function useCollation() {
   function updateRow(id: string, patch: Partial<AlignmentRow>) {
     commit('已更新校勘行', () => {
       const row = rows.value.find((item) => item.id === id);
-      if (row) Object.assign(row, patch, { manuallyAdjusted: true });
+      if (row) Object.assign(row, patch, { manuallyAdjusted: true, pendingReview: false });
     });
   }
 
@@ -309,6 +420,7 @@ export function useCollation() {
           row.similarity = 0;
         }
         row.manuallyAdjusted = true;
+        row.pendingReview = false;
       }
     });
   }
@@ -321,26 +433,57 @@ export function useCollation() {
       const [row] = rows.value.splice(index, 1);
       rows.value.splice(targetIndex, 0, row);
       row.manuallyAdjusted = true;
+      row.pendingReview = false;
     });
   }
 
   function acceptRows(ids: string[]) {
     if (!ids.length) return;
-    commit(`已接受 ${ids.length} 条校对建议`, () => {
-      const selected = new Set(ids);
+    const conflictIds = new Set(rows.value.filter((row) => row.conflict).map((row) => row.id));
+    const blocked = ids.filter((id) => conflictIds.has(id));
+    const allowed = ids.filter((id) => !conflictIds.has(id));
+    if (blocked.length) {
+      message.value = `${blocked.length} 条行合并冲突尚未裁决，不能接受；已跳过冲突行`;
+    }
+    if (!allowed.length) return;
+    commit(`已接受 ${allowed.length} 条校对建议`, () => {
+      const selected = new Set(allowed);
       rows.value.forEach((row) => {
-        if (selected.has(row.id)) row.accepted = true;
+        if (selected.has(row.id)) {
+          row.accepted = true;
+          row.pendingReview = false;
+        }
       });
       selectedRowIds.value = [];
     });
   }
 
   function acceptAll() {
+    if (conflictCount.value) {
+      message.value = `存在 ${conflictCount.value} 条待裁决行冲突，处理前不能接受；请先在“待裁决冲突”中裁决`;
+      return;
+    }
     commit('已批量接受全部差异建议', () => {
       rows.value.forEach((row) => {
         row.accepted = true;
+        row.pendingReview = false;
       });
       selectedRowIds.value = [];
+    });
+  }
+
+  function resolveConflict(id: string, side: 'local' | 'remote') {
+    const row = rows.value.find((item) => item.id === id);
+    if (!row || !row.conflict) return;
+    const judgment = side === 'local' ? row.conflict.local : row.conflict.remote;
+    commit(side === 'local' ? '已采用本方判断，冲突已裁决' : '已采用对方判断，冲突已裁决', () => {
+      row.status = judgment.status;
+      row.note = judgment.note;
+      row.source = judgment.source;
+      row.accepted = false;
+      row.manuallyAdjusted = true;
+      row.pendingReview = false;
+      row.conflict = null;
     });
   }
 
@@ -377,6 +520,10 @@ export function useCollation() {
   }
 
   function exportMarkdown() {
+    if (conflictCount.value) {
+      message.value = '存在待裁决的行合并冲突，裁决前不能导出校勘记';
+      return '';
+    }
     const changed = rows.value.filter((row) => row.status !== 'same' || row.note || row.source);
     const lines = [
       '# 校勘记',
@@ -400,6 +547,10 @@ export function useCollation() {
   }
 
   function exportJson() {
+    if (conflictCount.value) {
+      message.value = '存在待裁决的行合并冲突，裁决前不能导出校勘数据';
+      return '';
+    }
     return JSON.stringify(
       {
         left: leftVersion.value,
@@ -413,20 +564,231 @@ export function useCollation() {
     );
   }
 
-  onMounted(() => {
+  // ---- 写入租约与离线合并 ----
+
+  async function tryAcquireLease(): Promise<boolean> {
+    const lease = readLease();
+    if (!leaseIsStale(lease) && lease?.tabId !== tabId) return false;
+    const now = Date.now();
+    const next: WriteLease = { tabId, acquiredAt: lease?.acquiredAt ?? now, beatAt: now };
+    writeLease(next);
+    await wait(90);
+    const current = readLease();
+    return current?.tabId === tabId;
+  }
+
+  function startHeartbeat() {
+    if (heartbeatTimer !== undefined) return;
+    heartbeatTimer = window.setInterval(() => {
+      if (relayState.value === 'holder') {
+        const lease = readLease();
+        if (lease && lease.tabId !== tabId) {
+          lostLease();
+          return;
+        }
+        writeLease({ tabId, acquiredAt: lease?.acquiredAt ?? Date.now(), beatAt: Date.now() });
+      } else {
+        const lease = readLease();
+        leaseHolderId.value = lease?.tabId ?? '';
+        if (leaseIsStale(lease)) {
+          void tryAcquireLease().then((acquired) => {
+            if (acquired) void onBecameHolder();
+          });
+        }
+      }
+    }, HEARTBEAT_INTERVAL);
+  }
+
+  function lostLease() {
+    relayState.value = 'waiter';
+    leaseHolderId.value = readLease()?.tabId ?? '';
+    message.value = '写入权已被其他页签接管；本页签改动保留在本地，下次获得写入权时合并';
+    refreshPendingCount();
+  }
+
+  async function mergeWithRemote(remoteRaw: string) {
+    if (merging) return;
+    merging = true;
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (raw) {
-        restore(raw);
-        message.value = '已恢复浏览器中的校勘草稿';
+      const baseState = JSON.parse(baseRaw) as PersistedCollationState;
+      const remoteState = JSON.parse(remoteRaw) as PersistedCollationState;
+      const localState = JSON.parse(snapshot()) as PersistedCollationState;
+      const result = mergeStates(baseState, localState, remoteState);
+
+      const rulesChanged = !rulesEqual(result.rules, baseState.rules);
+      if (rulesChanged) applyRulesInvalidation(result.rows, result.rules);
+
+      const mergedState: PersistedCollationState = {
+        versions: result.versions,
+        leftVersionId: result.leftVersionId,
+        rightVersionId: result.rightVersionId,
+        rows: result.rows,
+        rules: result.rules,
+        selectedRowId:
+          result.rows.find((row) => row.conflict)?.id ??
+          result.rows.find((row) => row.status !== 'same')?.id ??
+          result.rows[0]?.id ??
+          ''
+      };
+      const mergedRaw = JSON.stringify(mergedState);
+
+      if (!probeQuota(mergedRaw)) {
+        message.value = '合并后数据超出本地存储容量，已拒绝合并，原稿未改动';
+        removeLease();
+        relayState.value = 'waiter';
+        leaseHolderId.value = '';
+        return;
+      }
+
+      versions.value = result.versions;
+      leftVersionId.value = result.leftVersionId;
+      rightVersionId.value = result.rightVersionId;
+      rules.value = result.rules;
+      rows.value = result.rows;
+      selectedRowId.value = mergedState.selectedRowId;
+      selectedRowIds.value = [];
+      baseRaw = mergedRaw;
+      try {
+        localStorage.setItem(STORAGE_KEY, mergedRaw);
+      } catch {
+        message.value = '本地存储写入失败，原稿未改动';
+        removeLease();
+        relayState.value = 'waiter';
+        return;
+      }
+      dirty.value = false;
+      refreshPendingCount();
+
+      const parts: string[] = [];
+      parts.push('离线改动已合并，草稿已接回');
+      if (result.conflicts.length) {
+        parts.push(`${result.conflicts.length} 条行冲突待裁决，处理前不能接受或导出`);
+      }
+      if (result.droppedCount) {
+        parts.push(`${result.droppedCount} 条对不上新对齐行的离线校记未挂接`);
+      }
+      if (rulesChanged) {
+        parts.push('比较规则已变更，已接受记录失效重算，人工挪动行标待复核');
+      }
+      message.value = parts.join('；');
+    } catch {
+      message.value = '离线合并失败，已保留本页签改动，原稿未改动';
+    } finally {
+      merging = false;
+    }
+  }
+
+  async function onBecameHolder() {
+    relayState.value = 'holder';
+    leaseHolderId.value = tabId;
+    const remoteRaw = localStorage.getItem(STORAGE_KEY);
+
+    if (!remoteRaw) {
+      if (!baseRaw) {
+        message.value = '已载入示例版本，正在自动对齐…';
+        await runAlignment(false);
+        baseRaw = snapshot();
+      } else {
+        baseRaw = snapshot();
+      }
+      dirty.value = false;
+      refreshPendingCount();
+      return;
+    }
+
+    if (!baseRaw) {
+      try {
+        restore(remoteRaw);
+        baseRaw = remoteRaw;
+        message.value = '已接回离线草稿，可继续写入';
+      } catch {
+        message.value = '本地草稿读取失败，已载入示例数据';
+        await runAlignment(false);
+        baseRaw = snapshot();
+      }
+      dirty.value = false;
+      refreshPendingCount();
+      return;
+    }
+
+    if (!dirty.value) {
+      try {
+        restore(remoteRaw);
+        baseRaw = remoteRaw;
+        message.value = '已同步其他页签的最新草稿';
+      } catch {
+        /* 保留本页签状态 */
+      }
+      refreshPendingCount();
+      return;
+    }
+
+    await mergeWithRemote(remoteRaw);
+  }
+
+  function onStorage(event: StorageEvent) {
+    if (event.key !== LEASE_KEY && event.key !== STORAGE_KEY) return;
+    if (relayState.value !== 'waiter') return;
+    const lease = readLease();
+    leaseHolderId.value = lease?.tabId ?? '';
+    if (leaseIsStale(lease)) {
+      void tryAcquireLease().then((acquired) => {
+        if (acquired) void onBecameHolder();
+      });
+    }
+  }
+
+  function onPageHide() {
+    if (relayState.value === 'holder') removeLease();
+  }
+
+  onMounted(async () => {
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('pagehide', onPageHide);
+    const remoteRaw = localStorage.getItem(STORAGE_KEY);
+    const acquired = await tryAcquireLease();
+    if (acquired) {
+      relayState.value = 'holder';
+      leaseHolderId.value = tabId;
+      if (remoteRaw) {
+        try {
+          restore(remoteRaw);
+          baseRaw = remoteRaw;
+          message.value = '已恢复浏览器中的校勘草稿';
+        } catch {
+          message.value = '本地草稿读取失败，已载入示例数据';
+          await runAlignment(false);
+          baseRaw = snapshot();
+        }
       } else {
         message.value = '已载入示例版本，正在自动对齐…';
-        void runAlignment(false);
+        await runAlignment(false);
+        baseRaw = snapshot();
       }
-    } catch {
-      message.value = '本地草稿读取失败，已载入示例数据';
-      void runAlignment(false);
+    } else {
+      relayState.value = 'waiter';
+      leaseHolderId.value = readLease()?.tabId ?? '';
+      if (remoteRaw) {
+        try {
+          restore(remoteRaw);
+          baseRaw = remoteRaw;
+          message.value = '其他页签正在写入；本页签可离线改动，下次获得写入权时合并';
+        } catch {
+          message.value = '本地草稿读取失败';
+        }
+      } else {
+        message.value = '正在等待其他页签完成首次写入…';
+      }
     }
+    dirty.value = false;
+    startHeartbeat();
+    refreshPendingCount();
+  });
+
+  onUnmounted(() => {
+    if (heartbeatTimer !== undefined) window.clearInterval(heartbeatTimer);
+    window.removeEventListener('storage', onStorage);
+    window.removeEventListener('pagehide', onPageHide);
   });
 
   watch(
@@ -457,6 +819,12 @@ export function useCollation() {
     differenceCount,
     acceptedCount,
     unresolvedCount,
+    relayState,
+    leaseHolderId,
+    dirty,
+    pendingChanges,
+    conflictCount,
+    pendingReviewCount,
     runAlignment,
     recalculate,
     updateRow,
@@ -464,6 +832,7 @@ export function useCollation() {
     moveRow,
     acceptRows,
     acceptAll,
+    resolveConflict,
     nextDifference,
     addVersion,
     undo,
